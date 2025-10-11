@@ -62,16 +62,7 @@ bool manualMode = false;
 WebServer server(80);
 
 void setup() {
-  // Initialize serial communication for debugging
-  Serial.begin(115200);
-  delay(2000);
-  
-  Serial.println();
-  Serial.println("========================================");
-  Serial.println("ESP32 Fuel Pump Controller Starting...");
-  Serial.println("========================================");
-  
-  // Configure pins
+  // Configure pins FIRST - critical for proper operation
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);  // Ensure pump is off initially
   pinMode(LED_PIN, OUTPUT);
@@ -81,7 +72,16 @@ void setup() {
   // Set attenuation for full 0-3.3V range on the specific pin
   analogSetPinAttenuation(FUEL_LEVEL_PIN, ADC_11db);
   
-  Serial.println("Initialization complete");
+  // Initialize serial communication for debugging
+  Serial.begin(115200);
+  delay(100);  // Short delay for serial to stabilize
+  
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("ESP32 Fuel Pump Controller Starting...");
+  Serial.println("========================================");
+  
+  Serial.println("Hardware initialization complete");
   Serial.println("Pin Configuration:");
   Serial.print("  Fuel Level Sensor: GPIO ");
   Serial.println(FUEL_LEVEL_PIN);
