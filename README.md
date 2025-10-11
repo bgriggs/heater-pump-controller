@@ -1,5 +1,5 @@
-# heater-pump-controller
-Diesel heater aux tank pump controller
+# Diesel Heater Auxiliary Tank Pump Controller
+Diesel heater aux tank pump controller. This manages an aux tank's fuel level keeping a small tank full from an RV tank that is closer to the heater. The small pump that feeds the heater is often insufficient to lift fuel from the main RV tank and is more susceptible to freezing.
 
 ## Overview
 This project implements an automatic fuel pump controller for an ESP-WROOM-32 (ESP32 ESP-32S) device. The controller monitors a fuel level sensor and automatically activates a relay-controlled fuel pump to maintain a full tank while implementing intelligent retry logic to prevent excessive pump cycling.
@@ -13,11 +13,11 @@ This project implements an automatic fuel pump controller for an ESP-WROOM-32 (E
 - **Visual LED feedback** for system status
 
 ## Hardware Requirements
-- **Microcontroller**: ESP-WROOM-32 (ESP32 ESP-32S)
-- **Fuel Level Sensor**: Analog sender (0.184V = Full, 1.001V = Empty)
-- **Relay Module**: 3.3V compatible relay module
-- **Fuel Pump**: Controlled by the relay
-- **Power Supply**: Appropriate for ESP32 and pump requirements
+- **Microcontroller**: ESP-WROOM-32 (ESP32 ESP-32S) (https://www.amazon.com/dp/B08D5ZD528?ref_=ppx_hzsearch_conn_dt_b_fed_asin_title_9)
+- **Fuel Level Sensor**: Analog sender (0.184V = Full, 1.001V = Empty) with 560 ohm reistor for voltage divider (https://www.amazon.com/dp/B0F93SSVCB)
+- **Relay Module**: 3.3V compatible relay module (https://www.amazon.com/dp/B0B1ZHXXXD)
+- **Fuel Pump**: Controlled by the relay (https://www.amazon.com/dp/B08PY7V2MM)
+- **Power Supply**: Appropriate for ESP32 and pump requirements (https://www.amazon.com/dp/B08RBWX2GL)
 - **WiFi Network**: 2.4GHz WiFi network for web interface access
 
 ## Pin Configuration
