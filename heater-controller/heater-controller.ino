@@ -10,8 +10,10 @@
 
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ESPmDNS.h>
 
 // WiFi Configuration
+const char* HOSTNAME = "heater-controller";  // Web interface at http://heater-controller.local
 const char* WIFI_SSID = "BigMission";
 const char* WIFI_PASSWORD = "";  // Set your WiFi password here
 
@@ -94,6 +96,7 @@ void setup() {
   // Connect to WiFi
   Serial.print("Connecting to WiFi: ");
   Serial.println(WIFI_SSID);
+  WiFi.setHostname(HOSTNAME);  // Must be set before WiFi.mode() to take effect
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   
@@ -122,6 +125,16 @@ void setup() {
   server.on("/toggle", handleToggle);
   server.begin();
   Serial.println("Web server started");
+
+  // Advertise HOSTNAME.local via mDNS (also works if WiFi connects after setup)
+  if (MDNS.begin(HOSTNAME)) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.print("mDNS started: http://");
+    Serial.print(HOSTNAME);
+    Serial.println(".local");
+  } else {
+    Serial.println("mDNS failed to start");
+  }
   Serial.println();
   
   // Initial state

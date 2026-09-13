@@ -125,9 +125,12 @@ State changed to: IDLE
 Before uploading, configure your WiFi credentials in the code:
 
 ```cpp
+const char* HOSTNAME = "heater-controller"; // Network name for the device
 const char* WIFI_SSID = "BigMission";      // Your WiFi network name
 const char* WIFI_PASSWORD = "";            // Your WiFi password
 ```
+
+The hostname is reported to the router via DHCP and advertised over mDNS, so the web interface is reachable at `http://heater-controller.local` as well as by IP address.
 
 **Note**: The ESP32 supports only 2.4GHz WiFi networks, not 5GHz.
 
@@ -179,6 +182,14 @@ const float REFILL_THRESHOLD = 30.0;     // Start refilling below 30%
 8. Access the web interface at http://[IP_ADDRESS]
 
 **Note**: The Arduino IDE requires sketch files to be in a folder with the same name as the .ino file.
+
+### PlatformIO (VS Code)
+The repo root contains a `platformio.ini` (board `esp32dev`), so the project can also be built from VS Code with the PlatformIO extension:
+1. **Configure WiFi**: Edit the WiFi credentials and hostname in `heater-controller/heater-controller.ino`
+2. Connect ESP32 to computer via USB. If no COM port appears, install the Silicon Labs CP210x USB to UART driver.
+3. Click **Upload** (→) in the PlatformIO toolbar
+4. Click **Serial Monitor** (plug icon) to view output at 115200 baud
+5. Access the web interface at http://heater-controller.local (or the IP address printed after "WiFi connected!")
 
 ## Wiring Diagram
 
