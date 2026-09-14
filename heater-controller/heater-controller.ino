@@ -12,6 +12,7 @@
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <PicoMQTT.h>  // MQTT broker - install "PicoMQTT" from the Arduino Library Manager
+#include <esp_system.h>  // esp_reset_reason() for the fail safe latch
 
 // WiFi Configuration
 const char* HOSTNAME = "heater-controller";  // Web interface at http://heater-controller.local
@@ -29,7 +30,7 @@ const unsigned long MQTT_PUBLISH_INTERVAL = 1000;  // 1 second; also publishes i
 // Pin Definitions
 #define FUEL_LEVEL_PIN 34        // Analog input pin (ADC1_CH6, use GPIO 34-39 for analog input only)
 #define RELAY_PIN 23             // Digital output pin to control relay
-#define LED_PIN 2                // Status LED - blinks at 1Hz (loop running) or 5Hz (pump active)
+#define LED_PIN 2                // Status LED - blinks at 1Hz (loop running) or 5Hz (pump active), solid (fail safe tripped)
 #define LED_ACTIVE_LOW false     // Set to true if LED is active-low (on when pin is LOW)
 
 // Fuel Level Constants (in volts)
@@ -41,10 +42,16 @@ const float ADC_MAX_VOLTAGE = 3.3;       // ESP32 ADC reference voltage
 const int ADC_RESOLUTION = 4095;         // 12-bit ADC (0-4095)
 
 // Timing Constants (in milliseconds)
-const unsigned long PUMP_RUN_TIME = 5 * 60 * 1000UL;        // 5 minutes
+const unsigned long PUMP_RUN_TIME = 3 * 60 * 1000UL;        // 3 minutes (must be less than PUMP_FAILSAFE_TIME)
 const unsigned long SHORT_WAIT_TIME = 60 * 60 * 1000UL;     // 1 hour
 const unsigned long LONG_WAIT_TIME = 6 * 60 * 60 * 1000UL;  // 6 hours
 const unsigned long SENSOR_READ_INTERVAL = 1000;            // 1 second
+
+// Fail Safe - hard coded backstop. If the relay stays on continuously this long for any reason (auto cycle,
+// manual command, or a logic fault), the pump is stopped and the controller latches into FAILSAFE. Web and
+// MQTT commands can't clear it; only a power cycle does.
+const unsigned long PUMP_FAILSAFE_TIME = 4 * 60 * 1000UL;   // 4 minutes
+static_assert(PUMP_RUN_TIME < PUMP_FAILSAFE_TIME, "PUMP_RUN_TIME must be less than PUMP_FAILSAFE_TIME");
 
 // Fuel Level Thresholds (percentage)
 const float FULL_THRESHOLD = 90.0;       // Consider tank full at 90%
@@ -56,7 +63,8 @@ enum PumpState {
   PUMPING,
   SHORT_WAIT,
   LONG_WAIT,
-  MANUAL  // Manual override mode
+  MANUAL,   // Manual override mode
+  FAILSAFE  // Pump ran too long - pump disabled until power is cycled
 };
 
 // Global Variables
@@ -68,6 +76,15 @@ float currentFuelLevel = 0.0;
 unsigned long lastLedToggle = 0;
 bool ledState = false;
 bool manualMode = false;
+
+// Fail Safe State
+unsigned long pumpOnSince = 0;  // millis() when the relay last turned on
+bool pumpWasOn = false;
+bool pumpCommandedOn = false;  // Set by startPump()/stopPump()
+bool failsafeTripped = false;
+// Latch in RTC memory - survives software, panic, and watchdog resets, but is cleared on a power-on reset
+const uint32_t FAILSAFE_LATCH_MAGIC = 0x46534146;  // "FSAF"
+RTC_NOINIT_ATTR uint32_t failsafeLatch;
 
 // Web Server
 WebServer server(80);
@@ -101,14 +118,21 @@ struct StatusSnapshot {
   bool pumpOn;
   PumpState state;
   bool manual;
+  bool failsafe;
 };
-StatusSnapshot statusSnapshot = {0.0, false, IDLE, false};
+StatusSnapshot statusSnapshot = {0.0, false, IDLE, false, false};
 portMUX_TYPE statusMux = portMUX_INITIALIZER_UNLOCKED;
 
 void setup() {
   // Configure pins FIRST - critical for proper operation
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);  // Ensure pump is off initially
+
+  // Restore a tripped fail safe after a software, panic, or watchdog reset - only a power cycle clears it
+  if (esp_reset_reason() == ESP_RST_POWERON) {
+    failsafeLatch = 0;
+  }
+  failsafeTripped = (failsafeLatch == FAILSAFE_LATCH_MAGIC);
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);    // Ensure LED is off initially
   
@@ -187,6 +211,10 @@ void setup() {
   currentState = IDLE;
   stateStartTime = millis();
   attemptCount = 0;
+  if (failsafeTripped) {
+    currentState = FAILSAFE;
+    Serial.println("!!! FAIL SAFE STILL TRIPPED after a non-power-on reset - pump disabled until power is cycled !!!");
+  }
   updateStatusSnapshot();
 
   // Service the web server and MQTT broker in their own task on core 0, so a slow or vanished client can't
@@ -197,12 +225,18 @@ void setup() {
       xTaskCreatePinnedToCore(networkTask, "network", 8192, NULL, tskIDLE_PRIORITY, NULL, 0) != pdPASS) {
     Serial.println("Failed to start network task - web interface and MQTT unavailable");
   }
+
+  // Reboot if loop() ever hangs for 5 seconds - the fail safe runs in loop(), and setup() turns the relay off
+  enableLoopWDT();
 }
 
 void loop() {
   unsigned long currentTime = millis();
   
-  // Apply commands queued by the web interface and MQTT (see networkTask)
+  // Hard fail safe - checked first on every pass, whatever the mode or state
+  checkPumpFailsafe(currentTime);
+
+  // Apply commands queued by the web interface and MQTT (see networkTask); ignored once the fail safe trips
   applyQueuedCommands();
   
   // Read fuel level periodically
@@ -214,11 +248,12 @@ void loop() {
   // LED blinks at different rates depending on pump status
   // Pump ON (relay active): 5Hz (100ms on, 100ms off) - fast blink
   // Pump OFF: 1Hz (500ms on, 500ms off) - slow heartbeat
+  // Fail safe tripped: solid on
   bool pumpIsRunning = (digitalRead(RELAY_PIN) == HIGH);
   unsigned long ledInterval = pumpIsRunning ? 100 : 500;
   
   if (currentTime - lastLedToggle >= ledInterval) {
-    ledState = !ledState;
+    ledState = failsafeTripped ? true : !ledState;
     // Handle active-low or active-high LED
     if (LED_ACTIVE_LOW) {
       digitalWrite(LED_PIN, ledState ? LOW : HIGH);  // Inverted for active-low
@@ -228,8 +263,8 @@ void loop() {
     lastLedToggle = currentTime;
   }
   
-  // State machine (only run if not in manual mode)
-  if (!manualMode) {
+  // State machine (only run in automatic mode, and never after the fail safe trips)
+  if (!manualMode && !failsafeTripped) {
     switch (currentState) {
       case IDLE:
         handleIdleState(currentTime);
@@ -249,6 +284,10 @@ void loop() {
         
       case MANUAL:
         // Manual mode - do nothing, controlled by web interface or MQTT commands
+        break;
+
+      case FAILSAFE:
+        // Never reached - the state machine doesn't run once the fail safe trips
         break;
     }
   }
@@ -288,13 +327,48 @@ bool isTankFull() {
 // Start the pump
 void startPump() {
   digitalWrite(RELAY_PIN, HIGH);
+  pumpCommandedOn = true;
   Serial.println(">>> PUMP STARTED <<<");
 }
 
 // Stop the pump
 void stopPump() {
   digitalWrite(RELAY_PIN, LOW);
+  pumpCommandedOn = false;
   Serial.println(">>> PUMP STOPPED <<<");
+}
+
+// Hard fail safe: trip if the relay has been on continuously for PUMP_FAILSAFE_TIME.
+// Watches the relay output itself, so it covers auto cycles, manual commands, and logic faults alike.
+void checkPumpFailsafe(unsigned long currentTime) {
+  if (failsafeTripped) {
+    digitalWrite(RELAY_PIN, LOW);  // Keep the pump off no matter what else runs
+    return;
+  }
+
+  // Time the commanded state as well as the pin, in case the relay input drags the pin below the HIGH threshold
+  bool pumpOn = pumpCommandedOn || digitalRead(RELAY_PIN) == HIGH;
+  if (pumpOn && !pumpWasOn) {
+    pumpOnSince = currentTime;
+  }
+  pumpWasOn = pumpOn;
+
+  if (pumpOn && currentTime - pumpOnSince >= PUMP_FAILSAFE_TIME) {
+    tripFailsafe();
+  }
+}
+
+// Stop the pump and latch FAILSAFE until power is cycled
+void tripFailsafe() {
+  stopPump();
+  failsafeTripped = true;
+  failsafeLatch = FAILSAFE_LATCH_MAGIC;
+  manualMode = false;
+  currentState = FAILSAFE;
+  Serial.print("!!! FAIL SAFE TRIPPED - pump ran continuously for ");
+  Serial.print(PUMP_FAILSAFE_TIME / 60000);
+  Serial.println(" minutes !!!");
+  Serial.println("Pump disabled until power is cycled; web and MQTT commands are ignored");
 }
 
 // Transition to a new state
@@ -350,11 +424,16 @@ void handleIdleState(unsigned long currentTime) {
 // Handle PUMPING state
 void handlePumpingState(unsigned long currentTime) {
   unsigned long elapsedTime = currentTime - stateStartTime;
+  // Also count continuous relay on-time from before this cycle (a manual run, or AUTO resent mid-fill, leaves
+  // the relay on), so an automatic cycle always stops before the fail safe can trip
+  if (pumpWasOn && currentTime - pumpOnSince > elapsedTime) {
+    elapsedTime = currentTime - pumpOnSince;
+  }
   
   // Print status every 5 seconds while pumping
   static unsigned long lastStatusPrint = 0;
   if (currentTime - lastStatusPrint >= 5000) {
-    unsigned long remainingTime = PUMP_RUN_TIME - elapsedTime;
+    unsigned long remainingTime = elapsedTime < PUMP_RUN_TIME ? PUMP_RUN_TIME - elapsedTime : 0;
     Serial.print("PUMPING - Fuel Level: ");
     Serial.print(currentFuelLevel, 1);
     Serial.print("%, Time remaining: ");
@@ -487,12 +566,14 @@ void handleRoot() {
   html += ".pump-off { background: #f44336; color: white; }";
   html += ".button { width: 100%; padding: 20px; font-size: 20px; font-weight: bold; border: none; border-radius: 8px; cursor: pointer; margin: 10px 0; transition: all 0.3s; }";
   html += ".button:hover { opacity: 0.8; transform: scale(1.02); }";
+  html += ".button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }";
   html += ".button-on { background: #4CAF50; color: white; }";
   html += ".button-off { background: #f44336; color: white; }";
   html += ".button-auto { background: #2196F3; color: white; }";
   html += ".mode-badge { display: inline-block; padding: 5px 15px; border-radius: 15px; font-size: 14px; margin-left: 10px; }";
   html += ".mode-auto { background: #2196F3; color: white; }";
   html += ".mode-manual { background: #ff9800; color: white; }";
+  html += ".failsafe { background: #b71c1c; color: white; text-align: center; font-size: 20px; font-weight: bold; padding: 15px; border-radius: 8px; margin: 20px 0; }";
   html += "</style>";
   html += "</head><body>";
   html += "<div class='container'>";
@@ -508,10 +589,11 @@ void handleRoot() {
   html += "<div class='info-row'><span class='info-label'>Mode:</span><span class='info-value' id='mode'>--</span></div>";
   html += "</div>";
   
+  html += "<div class='failsafe' id='failsafe' style='display: none'>FAIL SAFE TRIPPED<br>The pump ran continuously for " + String(PUMP_FAILSAFE_TIME / 60000) + " minutes and is disabled. Cycle power to reset.</div>";
   html += "<div class='pump-status' id='pumpStatus'>PUMP OFF</div>";
   
   html += "<button class='button button-on' id='toggleBtn' onclick='togglePump()'>TURN PUMP ON</button>";
-  html += "<button class='button button-auto' onclick='setAutoMode()'>RETURN TO AUTO MODE</button>";
+  html += "<button class='button button-auto' id='autoBtn' onclick='setAutoMode()'>RETURN TO AUTO MODE</button>";
   
   html += "</div>";
   
@@ -527,6 +609,9 @@ void handleRoot() {
   html += "    document.getElementById('modeBadge').className = 'mode-badge ' + (data.manual ? 'mode-manual' : 'mode-auto');";
   html += "    var pumpStatus = document.getElementById('pumpStatus');";
   html += "    var toggleBtn = document.getElementById('toggleBtn');";
+  html += "    document.getElementById('failsafe').style.display = data.failsafe ? 'block' : 'none';";
+  html += "    toggleBtn.disabled = data.failsafe;";
+  html += "    document.getElementById('autoBtn').disabled = data.failsafe;";
   html += "    if (data.pumpOn) {";
   html += "      pumpStatus.textContent = 'PUMP ON';";
   html += "      pumpStatus.className = 'pump-status pump-on';";
@@ -565,6 +650,7 @@ String buildStatusJson(const StatusSnapshot& status) {
     case SHORT_WAIT: stateStr = "SHORT_WAIT"; break;
     case LONG_WAIT: stateStr = "LONG_WAIT"; break;
     case MANUAL: stateStr = "MANUAL"; break;
+    case FAILSAFE: stateStr = "FAILSAFE"; break;
   }
   
   String json = "{";
@@ -572,7 +658,8 @@ String buildStatusJson(const StatusSnapshot& status) {
   json += "\"voltage\":" + String(voltage, 3) + ",";
   json += "\"pumpOn\":" + String(status.pumpOn ? "true" : "false") + ",";
   json += "\"state\":\"" + stateStr + "\",";
-  json += "\"manual\":" + String(status.manual ? "true" : "false");
+  json += "\"manual\":" + String(status.manual ? "true" : "false") + ",";
+  json += "\"failsafe\":" + String(status.failsafe ? "true" : "false");
   json += "}";
 
   return json;
@@ -585,6 +672,11 @@ void handleStatus() {
 
 // Toggle pump on/off or return to auto mode
 void handleToggle() {
+  if (getStatusSnapshot().failsafe) {
+    server.send(409, "text/plain", "Fail safe tripped - cycle power to reset");
+    return;
+  }
+
   CommandType type = server.hasArg("auto") ? CMD_AUTO : CMD_PUMP_TOGGLE;
   bool queued = queueCommand(type, "web interface");
   
@@ -622,6 +714,14 @@ bool queueCommand(CommandType type, const char* source) {
 void applyQueuedCommands() {
   ControlCommand command;
   while (xQueueReceive(commandQueue, &command, 0) == pdTRUE) {
+    // Authoritative check - also drops commands queued just before the fail safe tripped
+    if (failsafeTripped) {
+      Serial.print("Ignoring command from ");
+      Serial.print(command.source);
+      Serial.println(" - fail safe tripped");
+      continue;
+    }
+
     switch (command.type) {
       case CMD_PUMP_ON:
         setManualPump(true, command.source);
@@ -641,7 +741,7 @@ void applyQueuedCommands() {
 
 // Copy the current status for networkTask (called from loop())
 void updateStatusSnapshot() {
-  StatusSnapshot status = {currentFuelLevel, digitalRead(RELAY_PIN) == HIGH, currentState, manualMode};
+  StatusSnapshot status = {currentFuelLevel, digitalRead(RELAY_PIN) == HIGH, currentState, manualMode, failsafeTripped};
   portENTER_CRITICAL(&statusMux);
   statusSnapshot = status;
   portEXIT_CRITICAL(&statusMux);
@@ -694,6 +794,11 @@ void setAutoMode(const char* source) {
 
 // Queue a command published to the command topic: ON, OFF, TOGGLE, or AUTO (case-insensitive)
 void handleMqttCommand(const char* payload) {
+  if (getStatusSnapshot().failsafe) {
+    Serial.println("Ignoring MQTT command - fail safe tripped, cycle power to reset");
+    return;
+  }
+
   String command = payload;
   command.trim();
   command.toUpperCase();

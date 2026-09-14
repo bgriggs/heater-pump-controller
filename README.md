@@ -10,6 +10,7 @@ This project implements an automatic fuel pump controller for an ESP-WROOM-32 (E
 - **WiFi web interface** for remote monitoring and manual control
 - **Real-time status updates** via web dashboard (2 updates per second)
 - **Manual pump override** via web interface or MQTT
+- **Hard-coded fail safe** that disables the pump until a power cycle if it runs for 4 minutes continuously
 - **Built-in MQTT broker** so other applications on the local network can read status and send the same commands as the web interface
 - **Visual LED feedback** for system status
 
@@ -24,7 +25,7 @@ This project implements an automatic fuel pump controller for an ESP-WROOM-32 (E
 ## Pin Configuration
 - **GPIO 34** (ADC1_CH6): Fuel level sensor analog input
 - **GPIO 23**: Relay control output (3.3V HIGH to activate)
-- **GPIO 2**: Status LED - blinks at 1 Hz (loop running) or 5 Hz (pump active)
+- **GPIO 2**: Status LED - blinks at 1 Hz (loop running) or 5 Hz (pump active), solid when the fail safe has tripped
   - **Note**: If LED appears to blink erratically, GPIO 2 may have WiFi interference. Change `LED_PIN` to GPIO 4, 5, 16, 17, 18, or 19 in the code and use an external LED.
 
 ### Why GPIO 34 for Analog Input?
@@ -34,6 +35,7 @@ GPIO 34-39 on the ESP32 are input-only pins designed specifically for analog rea
 The single status LED on GPIO 2 provides visual feedback:
 - **Slow blink (1 Hz)**: System is running, pump is OFF
 - **Fast blink (5 Hz)**: Pump is actively running (relay energized)
+- **Solid on**: Fail safe tripped - pump disabled until power is cycled
 
 ## Fuel Level Sensing
 The system uses the ESP32's 12-bit ADC (0-4095) to read the fuel level sensor:
@@ -45,7 +47,7 @@ The system uses the ESP32's 12-bit ADC (0-4095) to read the fuel level sensor:
 ## Operating Logic
 
 ### State Machine
-The controller operates in four states:
+The controller operates in the following states:
 
 1. **IDLE**: Monitoring mode when tank is full
    - Checks fuel level every second
@@ -55,7 +57,7 @@ The controller operates in four states:
 2. **PUMPING**: Active pump operation
    - Relay activated (GPIO 23 HIGH)
    - LED blinks at 5 Hz (fast blink - pump ON)
-   - Maximum run time: 5 minutes per cycle
+   - Maximum run time: 3 minutes per cycle
    - Continuously monitors for full tank condition
    - Stops immediately if tank reaches full (90%+)
 
@@ -69,26 +71,42 @@ The controller operates in four states:
    - Activated after 2 unsuccessful pump cycles
    - Continues indefinitely with 6-hour intervals
    - LED blinks at 1 Hz (slow heartbeat - pump OFF)
-   - Each interval: 5 minutes pumping, 6 hours waiting
+   - Each interval: up to 3 minutes pumping, 6 hours waiting
+
+5. **FAILSAFE**: Pump ran continuously for 4 minutes
+   - Pump stopped; the state machine and all web and MQTT commands are disabled
+   - LED on solid
+   - Cleared only by a power cycle (see [Fail Safe](#fail-safe))
 
 ### Retry Logic
-1. **First attempt**: Pump for up to 5 minutes
+1. **First attempt**: Pump for up to 3 minutes
    - If full: Return to IDLE
    - If not full: Wait 1 hour, then retry
    
-2. **Second attempt**: Pump for up to 5 minutes
+2. **Second attempt**: Pump for up to 3 minutes
    - If full: Return to IDLE
    - If not full: Enter 6-hour interval mode
    
 3. **Subsequent attempts**: Continue indefinitely
-   - Pump for 5 minutes every 6 hours
+   - Pump for up to 3 minutes every 6 hours
    - If tank ever reaches full: Return to IDLE and reset attempt counter
 
 ### Safety Features
-- Maximum 5-minute pump run time per cycle prevents pump damage
+- Maximum 3-minute pump run time per automatic cycle prevents pump damage
+- Hard-coded 4-minute fail safe that disables the pump until a power cycle (see below)
 - Automatic pump shutoff when tank is full
 - Monitors for external filling (manual fill) even during wait periods
 - Low CPU usage with strategic delays
+
+### Fail Safe
+As a hard-coded backstop, if the pump runs continuously for 4 minutes (`PUMP_FAILSAFE_TIME`) for any reason - in practice a manual `ON` left running or a logic fault, since automatic cycles stop at 3 minutes - the controller:
+- Stops the pump and enters the `FAILSAFE` state
+- Reports `"state":"FAILSAFE"` and `"failsafe":true` in the status (web and MQTT), shows a banner in the web interface, and turns the status LED on solid
+- Ignores all web interface and MQTT commands (the web interface's `/toggle` returns HTTP 409)
+
+Nothing on the network can clear it - cycle power to reset. The trip is stored in RTC memory, so it also survives software, crash, and watchdog resets; only a power-on reset clears it. Pressing the board's EN button, uploading firmware, or a computer on the USB port resetting the board (some serial monitors do this when they connect) also counts as a power-on reset. The fail safe watches the relay output directly, independent of the state machine, and if `loop()` ever hangs for 5 seconds the loop watchdog reboots the controller, which turns the relay off.
+
+The automatic run limit (`PUMP_RUN_TIME`, 3 minutes) is kept below the fail safe time - the build fails if it isn't - so a fill attempt that runs out of time stops and retries later instead of tripping the fail safe. The automatic limit also counts time the relay was already on when the cycle started (for example, returning to automatic mode while the pump is running), so the relay never stays on for more than 3 minutes in automatic mode.
 
 ## Serial Monitoring
 The controller outputs detailed status information via Serial (115200 baud):
@@ -112,9 +130,9 @@ IDLE - Fuel Level: 28.5% (0.769V)
 Tank below refill threshold (28.5% < 30%), starting pump cycle
 >>> PUMP STARTED <<<
 State changed to: PUMPING
-PUMPING - Fuel Level: 45.2%, Time remaining: 295 seconds
-PUMPING - Fuel Level: 78.1%, Time remaining: 230 seconds
-PUMPING - Fuel Level: 88.3%, Time remaining: 185 seconds
+PUMPING - Fuel Level: 45.2%, Time remaining: 175 seconds
+PUMPING - Fuel Level: 78.1%, Time remaining: 110 seconds
+PUMPING - Fuel Level: 88.3%, Time remaining: 65 seconds
 Tank full detected (90.4%)!
 >>> PUMP STOPPED <<<
 State changed to: IDLE
@@ -148,7 +166,7 @@ Topics use the hostname as a prefix:
 Status is published every second (`MQTT_PUBLISH_INTERVAL`) and immediately whenever the pump, state, or mode changes. The payload is identical to the web interface's `http://heater-controller.local/status` endpoint:
 
 ```json
-{"fuelLevel":85.3,"voltage":0.304,"pumpOn":false,"state":"IDLE","manual":false}
+{"fuelLevel":85.3,"voltage":0.304,"pumpOn":false,"state":"IDLE","manual":false,"failsafe":false}
 ```
 
 | Field | Description |
@@ -156,8 +174,9 @@ Status is published every second (`MQTT_PUBLISH_INTERVAL`) and immediately whene
 | `fuelLevel` | Fuel level percentage (0-100) |
 | `voltage` | Fuel sender voltage |
 | `pumpOn` | `true` when the relay is energized |
-| `state` | `IDLE`, `PUMPING`, `SHORT_WAIT`, `LONG_WAIT`, or `MANUAL` |
+| `state` | `IDLE`, `PUMPING`, `SHORT_WAIT`, `LONG_WAIT`, `MANUAL`, or `FAILSAFE` |
 | `manual` | `true` when manual override is active (from the web interface or MQTT) |
+| `failsafe` | `true` when the fail safe has tripped - the pump is disabled until power is cycled |
 
 Commands do the same thing as the web interface buttons and are case-insensitive:
 
@@ -168,7 +187,7 @@ Commands do the same thing as the web interface buttons and are case-insensitive
 | `TOGGLE` | Switch to manual mode and toggle the pump (the web interface's pump button) |
 | `AUTO` | Turn the pump off and return to automatic mode, restarting the refill cycle (the "Return to Auto Mode" button) |
 
-**Note**: In manual mode the pump stays in the commanded state - the 5-minute run limit and full-tank shutoff only apply in automatic mode. Because `AUTO` restarts the refill cycle, sending it while already in automatic mode interrupts any pump run or wait in progress.
+**Note**: In manual mode the pump stays in the commanded state - the 3-minute run limit and full-tank shutoff only apply in automatic mode, but the 4-minute [fail safe](#fail-safe) always applies. Because `AUTO` restarts the refill cycle, sending it while already in automatic mode interrupts any pump run or wait in progress. While the fail safe is tripped, all commands are ignored.
 
 The broker is built on the [PicoMQTT](https://github.com/mlesniew/PicoMQTT) library, which keeps it small but has some limits:
 - **No retained messages** - a new subscriber receives status on the next publish, within a second
@@ -187,7 +206,7 @@ All timing and threshold values can be adjusted in the code:
 
 ```cpp
 // Timing (in milliseconds)
-const unsigned long PUMP_RUN_TIME = 5 * 60 * 1000UL;        // 5 minutes
+const unsigned long PUMP_RUN_TIME = 3 * 60 * 1000UL;        // 3 minutes (must be less than PUMP_FAILSAFE_TIME, 4 minutes)
 const unsigned long SHORT_WAIT_TIME = 60 * 60 * 1000UL;     // 1 hour
 const unsigned long LONG_WAIT_TIME = 6 * 60 * 60 * 1000UL;  // 6 hours
 
@@ -298,11 +317,17 @@ Fuel Pump - → Power Supply -
 - Verify fuel level sensor is working correctly
 - Check that voltage decreases as tank fills
 - Ensure FULL_THRESHOLD is achievable with your sensor
+- The fail safe stops the pump after 4 minutes of continuous running (see [Fail Safe](#fail-safe))
 
 ### MQTT client can't connect or commands are ignored
 - Check the Serial output for `MQTT broker started on port 1883`
 - Connect by IP address if the client machine can't resolve `heater-controller.local`
 - Commands must be published to `heater-controller/command` with a payload of `ON`, `OFF`, `TOGGLE`, or `AUTO`; anything else is logged as `Ignoring unknown MQTT command`
+- While the fail safe is tripped, all commands are ignored until power is cycled
+
+### Fail safe tripped (LED solid, state `FAILSAFE`)
+- The pump ran continuously for 4 minutes. Automatic cycles stop at 3 minutes, so the usual cause is the pump left on in manual mode (`ON`, `TOGGLE`, or the web interface's pump button); otherwise check the Serial log for what kept it running
+- Fix the cause, then cycle power to reset - web and MQTT commands can't clear it
 
 ## License
 See LICENSE file for details.
