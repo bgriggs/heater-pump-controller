@@ -11,11 +11,20 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <PicoMQTT.h>  // MQTT broker - install "PicoMQTT" from the Arduino Library Manager
 
 // WiFi Configuration
 const char* HOSTNAME = "heater-controller";  // Web interface at http://heater-controller.local
 const char* WIFI_SSID = "BigMission";
 const char* WIFI_PASSWORD = "";  // Set your WiFi password here
+
+// MQTT Broker Configuration
+// The controller runs its own MQTT broker, so other applications connect straight to it (no external broker needed).
+// Topics use HOSTNAME as the prefix:
+//   heater-controller/status   JSON status, same fields as the web interface's /status
+//   heater-controller/command  ON, OFF, TOGGLE (manual mode) or AUTO - the same actions as the web interface buttons
+const uint16_t MQTT_PORT = 1883;
+const unsigned long MQTT_PUBLISH_INTERVAL = 1000;  // 1 second; also publishes immediately on pump/state/mode change
 
 // Pin Definitions
 #define FUEL_LEVEL_PIN 34        // Analog input pin (ADC1_CH6, use GPIO 34-39 for analog input only)
@@ -62,6 +71,39 @@ bool manualMode = false;
 
 // Web Server
 WebServer server(80);
+
+// MQTT Broker - serviced by networkTask alongside the web server
+PicoMQTT::Server mqtt(MQTT_PORT);
+String mqttStatusTopic;
+String mqttCommandTopic;
+unsigned long lastMqttPublish = 0;
+bool lastPublishedPumpOn = false;
+PumpState lastPublishedState = IDLE;
+bool lastPublishedManual = false;
+
+// Commands from the web interface and MQTT. Those run in networkTask, so commands are queued
+// and applied by loop(), which owns the pump state machine.
+enum CommandType {
+  CMD_PUMP_ON,
+  CMD_PUMP_OFF,
+  CMD_PUMP_TOGGLE,
+  CMD_AUTO
+};
+struct ControlCommand {
+  CommandType type;
+  const char* source;  // String literal for logging, e.g. "web interface"
+};
+QueueHandle_t commandQueue = NULL;
+
+// Status snapshot - written by loop(), read by networkTask for /status and MQTT
+struct StatusSnapshot {
+  float fuelLevel;
+  bool pumpOn;
+  PumpState state;
+  bool manual;
+};
+StatusSnapshot statusSnapshot = {0.0, false, IDLE, false};
+portMUX_TYPE statusMux = portMUX_INITIALIZER_UNLOCKED;
 
 void setup() {
   // Configure pins FIRST - critical for proper operation
@@ -129,25 +171,39 @@ void setup() {
   // Advertise HOSTNAME.local via mDNS (also works if WiFi connects after setup)
   if (MDNS.begin(HOSTNAME)) {
     MDNS.addService("http", "tcp", 80);
+    MDNS.addService("mqtt", "tcp", MQTT_PORT);
     Serial.print("mDNS started: http://");
     Serial.print(HOSTNAME);
     Serial.println(".local");
   } else {
     Serial.println("mDNS failed to start");
   }
+
+  // Start the MQTT broker (status publishing and commands)
+  setupMqtt();
   Serial.println();
   
   // Initial state
   currentState = IDLE;
   stateStartTime = millis();
   attemptCount = 0;
+  updateStatusSnapshot();
+
+  // Service the web server and MQTT broker in their own task on core 0, so a slow or vanished client can't
+  // hold up the pump state machine in loop() on core 1. Idle priority because the libraries busy-wait on
+  // stalled clients; at a higher priority that would starve core 0's idle task and trip the task watchdog.
+  commandQueue = xQueueCreate(8, sizeof(ControlCommand));
+  if (commandQueue == NULL ||
+      xTaskCreatePinnedToCore(networkTask, "network", 8192, NULL, tskIDLE_PRIORITY, NULL, 0) != pdPASS) {
+    Serial.println("Failed to start network task - web interface and MQTT unavailable");
+  }
 }
 
 void loop() {
   unsigned long currentTime = millis();
   
-  // Handle web server requests
-  server.handleClient();
+  // Apply commands queued by the web interface and MQTT (see networkTask)
+  applyQueuedCommands();
   
   // Read fuel level periodically
   if (currentTime - lastSensorRead >= SENSOR_READ_INTERVAL) {
@@ -192,11 +248,14 @@ void loop() {
         break;
         
       case MANUAL:
-        // Manual mode - do nothing, controlled by web interface
+        // Manual mode - do nothing, controlled by web interface or MQTT commands
         break;
     }
   }
   
+  // Share the latest status with networkTask (after the state machine so changes go out immediately)
+  updateStatusSnapshot();
+
   delay(10);  // Reduced delay for smoother LED blinking
 }
 
@@ -495,13 +554,12 @@ void handleRoot() {
   server.send(200, "text/html", html);
 }
 
-// Return status as JSON
-void handleStatus() {
-  bool pumpOn = digitalRead(RELAY_PIN) == HIGH;
-  float voltage = FUEL_FULL_VOLTAGE + (100.0 - currentFuelLevel) / 100.0 * (FUEL_EMPTY_VOLTAGE - FUEL_FULL_VOLTAGE);
+// Build status JSON - shared by the web interface (/status) and MQTT so both report the same data
+String buildStatusJson(const StatusSnapshot& status) {
+  float voltage = FUEL_FULL_VOLTAGE + (100.0 - status.fuelLevel) / 100.0 * (FUEL_EMPTY_VOLTAGE - FUEL_FULL_VOLTAGE);
   
   String stateStr;
-  switch (currentState) {
+  switch (status.state) {
     case IDLE: stateStr = "IDLE"; break;
     case PUMPING: stateStr = "PUMPING"; break;
     case SHORT_WAIT: stateStr = "SHORT_WAIT"; break;
@@ -510,42 +568,188 @@ void handleStatus() {
   }
   
   String json = "{";
-  json += "\"fuelLevel\":" + String(currentFuelLevel, 1) + ",";
+  json += "\"fuelLevel\":" + String(status.fuelLevel, 1) + ",";
   json += "\"voltage\":" + String(voltage, 3) + ",";
-  json += "\"pumpOn\":" + String(pumpOn ? "true" : "false") + ",";
+  json += "\"pumpOn\":" + String(status.pumpOn ? "true" : "false") + ",";
   json += "\"state\":\"" + stateStr + "\",";
-  json += "\"manual\":" + String(manualMode ? "true" : "false");
+  json += "\"manual\":" + String(status.manual ? "true" : "false");
   json += "}";
-  
-  server.send(200, "application/json", json);
+
+  return json;
+}
+
+// Return status as JSON
+void handleStatus() {
+  server.send(200, "application/json", buildStatusJson(getStatusSnapshot()));
 }
 
 // Toggle pump on/off or return to auto mode
 void handleToggle() {
-  if (server.hasArg("auto")) {
-    // Return to automatic mode
-    manualMode = false;
-    stopPump();
-    changeState(IDLE);
-    attemptCount = 0;
-    Serial.println("Returned to AUTO mode via web interface");
+  CommandType type = server.hasArg("auto") ? CMD_AUTO : CMD_PUMP_TOGGLE;
+  bool queued = queueCommand(type, "web interface");
+  
+  if (queued) {
+    server.send(200, "text/plain", "OK");
   } else {
-    // Toggle manual mode
-    if (!manualMode) {
-      manualMode = true;
-      currentState = MANUAL;
-      Serial.println("Entered MANUAL mode via web interface");
-    }
-    
-    // Toggle pump
-    if (digitalRead(RELAY_PIN) == HIGH) {
-      stopPump();
-      Serial.println("Pump turned OFF via web interface");
-    } else {
-      startPump();
-      Serial.println("Pump turned ON via web interface");
+    server.send(503, "text/plain", "Busy, try again");
+  }
+}
+
+// Network Task - services the web server and MQTT broker on core 0, so a slow or vanished client
+// can't delay the pump state machine in loop()
+void networkTask(void* parameter) {
+  for (;;) {
+    server.handleClient();
+    mqtt.loop();
+    publishMqttStatus(millis());
+    vTaskDelay(pdMS_TO_TICKS(10));  // Don't spin when there's nothing to do
+  }
+}
+
+// Queue a command for loop() to apply (called from networkTask). Returns false if it couldn't be queued.
+bool queueCommand(CommandType type, const char* source) {
+  ControlCommand command = {type, source};
+  // loop() drains the queue every ~10 ms, so wait briefly rather than drop the latest command of a burst
+  if (xQueueSend(commandQueue, &command, pdMS_TO_TICKS(100)) != pdTRUE) {
+    Serial.print("Command queue full, dropping command from ");
+    Serial.println(source);
+    return false;
+  }
+  return true;
+}
+
+// Apply commands queued by the web interface and MQTT (called from loop())
+void applyQueuedCommands() {
+  ControlCommand command;
+  while (xQueueReceive(commandQueue, &command, 0) == pdTRUE) {
+    switch (command.type) {
+      case CMD_PUMP_ON:
+        setManualPump(true, command.source);
+        break;
+      case CMD_PUMP_OFF:
+        setManualPump(false, command.source);
+        break;
+      case CMD_PUMP_TOGGLE:
+        setManualPump(digitalRead(RELAY_PIN) != HIGH, command.source);
+        break;
+      case CMD_AUTO:
+        setAutoMode(command.source);
+        break;
     }
   }
-  
-  server.send(200, "text/plain", "OK");
+}
+
+// Copy the current status for networkTask (called from loop())
+void updateStatusSnapshot() {
+  StatusSnapshot status = {currentFuelLevel, digitalRead(RELAY_PIN) == HIGH, currentState, manualMode};
+  portENTER_CRITICAL(&statusMux);
+  statusSnapshot = status;
+  portEXIT_CRITICAL(&statusMux);
+}
+
+// Read the latest status (called from networkTask)
+StatusSnapshot getStatusSnapshot() {
+  portENTER_CRITICAL(&statusMux);
+  StatusSnapshot status = statusSnapshot;
+  portEXIT_CRITICAL(&statusMux);
+  return status;
+}
+
+// Manual Control - applied by loop() for commands from the web interface and MQTT
+
+// Enter manual mode (if not already) and turn the pump on or off
+void setManualPump(bool on, const char* source) {
+  if (!manualMode) {
+    manualMode = true;
+    currentState = MANUAL;
+    Serial.print("Entered MANUAL mode via ");
+    Serial.println(source);
+  }
+
+  if (on == (digitalRead(RELAY_PIN) == HIGH)) {
+    return;  // Pump is already in the requested state
+  }
+  if (on) {
+    startPump();
+  } else {
+    stopPump();
+  }
+  Serial.print("Pump turned ");
+  Serial.print(on ? "ON" : "OFF");
+  Serial.print(" via ");
+  Serial.println(source);
+}
+
+// Turn the pump off and return to automatic mode, restarting the refill cycle
+void setAutoMode(const char* source) {
+  manualMode = false;
+  stopPump();
+  changeState(IDLE);
+  attemptCount = 0;
+  Serial.print("Returned to AUTO mode via ");
+  Serial.println(source);
+}
+
+// MQTT
+
+// Queue a command published to the command topic: ON, OFF, TOGGLE, or AUTO (case-insensitive)
+void handleMqttCommand(const char* payload) {
+  String command = payload;
+  command.trim();
+  command.toUpperCase();
+
+  if (command == "ON") {
+    queueCommand(CMD_PUMP_ON, "MQTT");
+  } else if (command == "OFF") {
+    queueCommand(CMD_PUMP_OFF, "MQTT");
+  } else if (command == "TOGGLE") {
+    queueCommand(CMD_PUMP_TOGGLE, "MQTT");
+  } else if (command == "AUTO") {
+    queueCommand(CMD_AUTO, "MQTT");
+  } else {
+    Serial.print("Ignoring unknown MQTT command: ");
+    Serial.println(command.substring(0, 20));  // Truncated - loop() waits on Serial too
+  }
+}
+
+// Start the MQTT broker and listen for commands from clients
+void setupMqtt() {
+  mqttStatusTopic = String(HOSTNAME) + "/status";
+  mqttCommandTopic = String(HOSTNAME) + "/command";
+
+  // Runs inside mqtt.loop() on networkTask. Only queue the command here - never publish from this callback,
+  // since the broker is still forwarding the incoming message to other subscribers.
+  mqtt.subscribe(mqttCommandTopic, [](const char* topic, const char* payload) {
+    handleMqttCommand(payload);
+  });
+
+  // Client packets are read synchronously in networkTask, so a client that connects without sending anything,
+  // or stalls mid-packet, holds up the web server and other clients (not pump control). This bounds each read;
+  // LAN clients respond in milliseconds.
+  mqtt.socket_timeout_millis = 1000;
+  mqtt.begin();
+
+  Serial.print("MQTT broker started on port ");
+  Serial.print(MQTT_PORT);
+  Serial.print(", topics: ");
+  Serial.print(mqttStatusTopic);
+  Serial.print(", ");
+  Serial.println(mqttCommandTopic);
+}
+
+// Publish status when the pump, state, or mode changes, and at least every MQTT_PUBLISH_INTERVAL
+void publishMqttStatus(unsigned long currentTime) {
+  StatusSnapshot status = getStatusSnapshot();
+  bool changed = status.pumpOn != lastPublishedPumpOn || status.state != lastPublishedState || status.manual != lastPublishedManual;
+  if (!changed && currentTime - lastMqttPublish < MQTT_PUBLISH_INTERVAL) {
+    return;
+  }
+
+  // Sent only to currently subscribed clients - the broker doesn't support retained messages
+  mqtt.publish(mqttStatusTopic, buildStatusJson(status));
+
+  lastMqttPublish = currentTime;
+  lastPublishedPumpOn = status.pumpOn;
+  lastPublishedState = status.state;
+  lastPublishedManual = status.manual;
 }

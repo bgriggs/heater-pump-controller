@@ -9,7 +9,8 @@ This project implements an automatic fuel pump controller for an ESP-WROOM-32 (E
 - **Intelligent retry logic** to prevent pump damage
 - **WiFi web interface** for remote monitoring and manual control
 - **Real-time status updates** via web dashboard (2 updates per second)
-- **Manual pump override** via web interface
+- **Manual pump override** via web interface or MQTT
+- **Built-in MQTT broker** so other applications on the local network can read status and send the same commands as the web interface
 - **Visual LED feedback** for system status
 
 ## Hardware Requirements
@@ -134,6 +135,53 @@ The hostname is reported to the router via DHCP and advertised over mDNS, so the
 
 **Note**: The ESP32 supports only 2.4GHz WiFi networks, not 5GHz.
 
+### MQTT
+The controller runs its own MQTT broker on port 1883 (`MQTT_PORT`), so other applications on the local network connect straight to `heater-controller.local` (or its IP address) - no separate broker is needed. The broker is advertised over mDNS as `_mqtt._tcp` and has no authentication, so anything on the network can read status and send commands.
+
+Topics use the hostname as a prefix:
+
+| Topic | Direction | Payload |
+|---|---|---|
+| `heater-controller/status` | Published by the controller | JSON status (see below) |
+| `heater-controller/command` | Sent by clients | `ON`, `OFF`, `TOGGLE`, or `AUTO` (see below) |
+
+Status is published every second (`MQTT_PUBLISH_INTERVAL`) and immediately whenever the pump, state, or mode changes. The payload is identical to the web interface's `http://heater-controller.local/status` endpoint:
+
+```json
+{"fuelLevel":85.3,"voltage":0.304,"pumpOn":false,"state":"IDLE","manual":false}
+```
+
+| Field | Description |
+|---|---|
+| `fuelLevel` | Fuel level percentage (0-100) |
+| `voltage` | Fuel sender voltage |
+| `pumpOn` | `true` when the relay is energized |
+| `state` | `IDLE`, `PUMPING`, `SHORT_WAIT`, `LONG_WAIT`, or `MANUAL` |
+| `manual` | `true` when manual override is active (from the web interface or MQTT) |
+
+Commands do the same thing as the web interface buttons and are case-insensitive:
+
+| Command | Action |
+|---|---|
+| `ON` | Switch to manual mode and turn the pump on |
+| `OFF` | Switch to manual mode and turn the pump off |
+| `TOGGLE` | Switch to manual mode and toggle the pump (the web interface's pump button) |
+| `AUTO` | Turn the pump off and return to automatic mode, restarting the refill cycle (the "Return to Auto Mode" button) |
+
+**Note**: In manual mode the pump stays in the commanded state - the 5-minute run limit and full-tank shutoff only apply in automatic mode. Because `AUTO` restarts the refill cycle, sending it while already in automatic mode interrupts any pump run or wait in progress.
+
+The broker is built on the [PicoMQTT](https://github.com/mlesniew/PicoMQTT) library, which keeps it small but has some limits:
+- **No retained messages** - a new subscriber receives status on the next publish, within a second
+- **QoS 0 delivery** - subscribers always receive messages at QoS 0. QoS 1 and 2 commands are acknowledged, but a command the client resends may be applied twice, so automations should send `ON`/`OFF` rather than `TOGGLE`
+- **No last will** - clients detect that the controller has gone offline when their connection drops
+- The web server and MQTT broker run in a background task separate from pump control, so network problems don't hold up the pump. They do share that task with each other: a subscriber that disappears without disconnecting (such as a sleeping phone) can pause the web interface and MQTT for about 10 seconds, and a client that stops partway through sending a request can leave them unresponsive for an extended period
+
+To watch status and send a command from another machine (use the IP address if it can't resolve `.local` names):
+```
+mosquitto_sub -h heater-controller.local -t "heater-controller/status"
+mosquitto_pub -h heater-controller.local -t "heater-controller/command" -m AUTO
+```
+
 ### Adjustable Parameters
 All timing and threshold values can be adjusted in the code:
 
@@ -171,6 +219,11 @@ const float REFILL_THRESHOLD = 30.0;     // Start refilling below 30%
    - Partition Scheme: Default
    - Core Debug Level: None (or "Info" for debugging)
 
+4. Install the MQTT broker library:
+   - Go to Sketch → Include Library → Manage Libraries
+   - Search for "PicoMQTT" and install it
+   - **Note**: If PicoMQTT fails to compile with ESP32 core 3.1.x, update the core to 3.2 or later, or uncomment `#define PICOMQTT_EXTRA_CONNECT_METHODS` in the library's `config.h`
+
 ### Upload Instructions
 1. **Configure WiFi**: Edit the WiFi credentials in the code
 2. Connect ESP32 to computer via USB
@@ -184,7 +237,7 @@ const float REFILL_THRESHOLD = 30.0;     // Start refilling below 30%
 **Note**: The Arduino IDE requires sketch files to be in a folder with the same name as the .ino file.
 
 ### PlatformIO (VS Code)
-The repo root contains a `platformio.ini` (board `esp32dev`), so the project can also be built from VS Code with the PlatformIO extension:
+The repo root contains a `platformio.ini` (board `esp32dev`), so the project can also be built from VS Code with the PlatformIO extension (it installs the PicoMQTT library automatically):
 1. **Configure WiFi**: Edit the WiFi credentials and hostname in `heater-controller/heater-controller.ino`
 2. Connect ESP32 to computer via USB. If no COM port appears, install the Silicon Labs CP210x USB to UART driver.
 3. Click **Upload** (→) in the PlatformIO toolbar
@@ -245,6 +298,11 @@ Fuel Pump - → Power Supply -
 - Verify fuel level sensor is working correctly
 - Check that voltage decreases as tank fills
 - Ensure FULL_THRESHOLD is achievable with your sensor
+
+### MQTT client can't connect or commands are ignored
+- Check the Serial output for `MQTT broker started on port 1883`
+- Connect by IP address if the client machine can't resolve `heater-controller.local`
+- Commands must be published to `heater-controller/command` with a payload of `ON`, `OFF`, `TOGGLE`, or `AUTO`; anything else is logged as `Ignoring unknown MQTT command`
 
 ## License
 See LICENSE file for details.
